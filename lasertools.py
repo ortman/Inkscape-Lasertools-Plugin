@@ -630,7 +630,7 @@ class laser_gcode(inkex.EffectExtension):
             style[sid] = style['biarc1'.format(i)].copy()
 
         if group is None:
-            group = self.layers[min(1, len(self.layers) - 1)].add(Group(gcodetools="Preview group"))
+            group = self.out_layer.add(Group(gcodetools="Preview group"))
             if not hasattr(self, "preview_groups"):
                 self.preview_groups = {layer: group}
             elif layer not in self.preview_groups:
@@ -856,7 +856,7 @@ class laser_gcode(inkex.EffectExtension):
             if 'transform' in g.keys():
                 t = g.get('transform')
                 t = Transform(t).matrix
-                trans = (Transform(t) * Transform(trans)).matrix if trans != [] else t
+                trans = (Transform(t) @ Transform(trans)).matrix if trans != [] else t
 
             g = g.getparent()
         return trans
@@ -973,7 +973,10 @@ class laser_gcode(inkex.EffectExtension):
                     self.svg.selected[i.get("id")] = i
                 if i.tag == inkex.addNS("g", 'svg') and i.get(inkex.addNS('groupmode', 'inkscape')) == 'layer':
                     self.layers += [i]
-                    recursive_search(i, i)
+                    if i.get(inkex.addNS('label', 'inkscape')) == 'layer_tools':
+                        self.out_layer = i
+                    else:
+                        recursive_search(i, i)
                 elif i.get('gcodetools') == "Gcodetools orientation group":
                     points = orient_points
                     if points != None:
@@ -1027,8 +1030,12 @@ class laser_gcode(inkex.EffectExtension):
                     print_("")
                     print_("Working on path: ")
                     print_debug(path.get("style"), path.get("d"))
+                    style = dict(Style.parse_str(path.get("style")))
+                    if style.get('fill') == 'none':
+                        continue
 
-                    area_group = path.getparent().add(Group())
+                    area_group = self.out_layer.add(Group())
+                    area_group.set(inkex.addNS('label', 'inkscape'), 'Area group')
                     csp = path.path.to_superpath()
                     if not csp:
                         print_("omitting non-path")
@@ -1057,7 +1064,7 @@ class laser_gcode(inkex.EffectExtension):
                     print_time("Time for calculating bounds")
 
                     # Zig-zag
-                    r = self.options.laser_beam_with
+                    r = self.options.laser_beam_with / self.svg.scale
                     if r <= 0:
                         self.error("Laser diameter must be greater than 0!", "error")
                         return
@@ -1298,8 +1305,9 @@ class laser_gcode(inkex.EffectExtension):
             if layer in self.svg.selected_paths:
                 # Calculate scale in pixels per user unit (mm or inch)
 
-                engraving_group = self.svg.selected_paths[layer][0].getparent().add(Group())
-
+                engraving_group = self.out_layer.add(Group())
+                engraving_group.set(inkex.addNS('label', 'inkscape'), 'Engraving group')
+                
                 for node in self.svg.selected_paths[layer]:
 
                     print_("")
@@ -1554,7 +1562,7 @@ class laser_gcode(inkex.EffectExtension):
 
     def recursiveFuseTransform(self, node, transf=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]):
 
-        transf = Transform(transf) * Transform(node.get("transform", None))
+        transf = Transform(transf) @ Transform(node.get("transform", None))
 
         if 'transform' in node.attrib:
             del node.attrib['transform']
@@ -1641,7 +1649,21 @@ class laser_gcode(inkex.EffectExtension):
         global options
         options = self.options
         options.self = self
+        self.out_layer = None
         global print_
+
+        for i in self.document.getroot().getchildren():
+            if i.tag == inkex.addNS("g", 'svg') and i.get(inkex.addNS('groupmode', 'inkscape')) == 'layer':
+                if i.get(inkex.addNS('label', 'inkscape')) == 'layer_tools':
+                    self.out_layer = i
+                    break
+        
+        if self.out_layer != None:
+            self.out_layer.clear()
+        else:
+            self.out_layer = self.document.getroot().add(Group())
+        self.out_layer.set(inkex.addNS('label', 'inkscape'), 'layer_tools')
+        self.out_layer.set(inkex.addNS('groupmode', 'inkscape'), 'layer')
 
         if self.options.log_create_log:
             if os.path.isdir(self.options.directory):
