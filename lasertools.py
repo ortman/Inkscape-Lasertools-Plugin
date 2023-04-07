@@ -84,6 +84,7 @@ orient_points = []
 
 #               x_min, y_min, x_max, y_max
 bounding_box = [900000, 900000, 0, 0]
+scale = 1
 
 
 def marker_style(stroke, marker='DrawCurveMarker', width=1):
@@ -756,7 +757,8 @@ class laser_gcode(inkex.EffectExtension):
 
         for i in range(1, len(curve)):
             #    Creating Gcode for curve between s=curve[i-1] and si=curve[i] start at s[0] end at s[4]=si[0]
-            s, si = curve[i-1], curve[i]
+            s = curve[i-1]
+            si = [[curve[i][0][0] * scale, curve[i][0][1] * scale]]
             newcoord_different = si[0][0] != pastX or si[0][1] != pastY
 
             #############################
@@ -1029,8 +1031,8 @@ class laser_gcode(inkex.EffectExtension):
 
                     print_("")
                     print_("Working on path: ")
-                    print_debug(path.get("style"), path.get("d"))
-                    style = dict(Style.parse_str(path.get("style")))
+                    style = Style.cascaded_style(path)
+                    print_debug(path.get('id'), style.to_str())
                     if style.get('fill') == 'none':
                         continue
 
@@ -1064,7 +1066,7 @@ class laser_gcode(inkex.EffectExtension):
                     print_time("Time for calculating bounds")
 
                     # Zig-zag
-                    r = self.options.laser_beam_with / self.svg.scale
+                    r = self.options.laser_beam_with / scale
                     if r <= 0:
                         self.error("Laser diameter must be greater than 0!", "error")
                         return
@@ -1657,7 +1659,12 @@ class laser_gcode(inkex.EffectExtension):
                 if i.get(inkex.addNS('label', 'inkscape')) == 'layer_tools':
                     self.out_layer = i
                     break
-        
+
+        global scale
+        scale = self.svg.uutounit(self.svg.viewport_width, 'mm') / self.svg.get_viewbox()[2]
+        print_('Scale', self.svg.scale, scale)
+        MARKER_STYLE['biarc_style']['line'] = marker_style('#f88', width=self.options.laser_beam_with / scale)
+
         if self.out_layer != None:
             self.out_layer.clear()
         else:
