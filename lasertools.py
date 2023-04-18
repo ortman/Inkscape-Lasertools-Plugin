@@ -1538,10 +1538,7 @@ class laser_gcode(inkex.EffectExtension):
         if transform:
             attr["transform"] = transform
 
-        doc_height = self.svg.unittouu(self.document.getroot().get('height'))
-        if self.document.getroot().get('height') == "100%":
-            doc_height = 1052.3622047
-            print_("Overriding height from 100 percents to {}".format(doc_height))
+        doc_height = self.svg.get_viewbox()[3]
 
         orient_points = [[[100, doc_height], [100., 0.0, 0.0]], [[0.0, doc_height], [0.0, 0.0, 0.0]]]
 
@@ -1661,8 +1658,7 @@ class laser_gcode(inkex.EffectExtension):
                     break
 
         global scale
-        scale = self.svg.uutounit(self.svg.viewport_width, 'mm') / self.svg.get_viewbox()[2]
-        print_('Scale', self.svg.scale, scale)
+        scale = self.svg.inkscape_scale
         MARKER_STYLE['biarc_style']['line'] = marker_style('#f88', width=self.options.laser_beam_with / scale)
 
         if self.out_layer != None:
