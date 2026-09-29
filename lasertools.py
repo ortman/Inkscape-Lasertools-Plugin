@@ -983,6 +983,18 @@ class laser_gcode(inkex.EffectExtension):
             sys.exit()
 
 ################################################################################
+# Objects which are hidden in Inkscape are not engraved
+################################################################################
+    def is_hidden(self, node):
+        try:
+            # is_visible() covers display, visibility and opacity of the
+            # object itself and of all of its parents, layers included
+            return not node.is_visible()
+        except Exception as e:
+            print_("Could not determine the visibility of '{}': {}".format(node.get_id(), e))
+            return False
+
+################################################################################
 # Let Inkscape convert all text objects into paths, the same way Path->Object
 # to Path (Shift+Ctrl+C) does. This runs on a copy of the document, the
 # drawing of the user stays untouched.
@@ -994,6 +1006,9 @@ class laser_gcode(inkex.EffectExtension):
             # Empty text frames are left over in a lot of documents and would
             # cost a call to Inkscape for nothing
             if len("".join(node.itertext()).strip()) == 0:
+                return False
+
+            if self.is_hidden(node):
                 return False
 
             # Definitions, the output layer and the labels of the orientation
@@ -1140,6 +1155,10 @@ class laser_gcode(inkex.EffectExtension):
             for i in items:
                 if selected:
                     self.svg.selected[i.get("id")] = i
+
+                if isinstance(i, ShapeElement) and self.is_hidden(i):
+                    print_("Skipping hidden {} '{}'".format(i.TAG, i.get_id()))
+                    continue
                 if i.tag == inkex.addNS("g", 'svg') and i.get(inkex.addNS('groupmode', 'inkscape')) == 'layer':
                     self.layers += [i]
                     if i.get(inkex.addNS('label', 'inkscape')) == 'layer_tools':
