@@ -188,7 +188,7 @@ def csp_line_intersection(l1, l2, sp1, sp2):
     aa = l2[1]-l1[1]
     if aa == cc == 0:
         return []
-    if aa:
+    if abs(aa) >= abs(cc):
         coef1 = cc/aa
         coef2 = 1
     else:
@@ -502,6 +502,7 @@ class laser_gcode(inkex.EffectExtension):
         add_argument("--linuxcnc", type=inkex.Boolean, dest="linuxcnc", default=False, help="Use G64 P0.1 trajectory planning")
         add_argument("--add-contours", type=inkex.Boolean, dest="add_contours", default=True, help="Add contour to Gcode paths")
         add_argument("--add-infill", type=inkex.Boolean, dest="add_infill", default=True, help="Add infill to Gcode paths")
+        add_argument("--infill-direction", dest="infill_direction", default="vertical", help="Direction of the infill lines: vertical, horizontal or cross")
         add_argument("--remove-tiny-infill-paths", type=inkex.Boolean, dest="remove_tiny_infill_paths", default=False, help="Remove tiny infill paths from Gcode")
 
         add_argument("--prefix1", dest="prefix_1", default="", help="First line before G-Code starts")
@@ -758,6 +759,14 @@ class laser_gcode(inkex.EffectExtension):
         if strategy == 'perimeter' and self.options.linuxcnc:
             g += "G64 P0.15 ;linuxcnc blend tolerence mode trajectory planning\n"
 
+        def line_axis(index):
+            # infill lines run along one axis only, which one depends on the
+            # selected infill direction
+            if index < len(curve) and len(curve[index]) > 2 and curve[index][1] == 'line':
+                start, end = curve[index][0], curve[index][2]
+                return "X" if abs(end[0]-start[0]) > abs(end[1]-start[1]) else "Y"
+            return "Y"
+
         # set the begining past coordinates to unlikely numbers
         pastX, pastY = -10000.05, 10000.01
 
@@ -775,7 +784,10 @@ class laser_gcode(inkex.EffectExtension):
             # move without overshoot moves the X and Y
             if newcoord_different and s[1] == 'move' and strategy == "infill":
                 if round(self.options.infill_overshoot, 1) > 0:
-                    g += "G00 X" + str(round(si[0][0], 2)) + " " + ft + "\n"
+                    if line_axis(i) == "X":
+                        g += "G00 Y" + str(round(si[0][1], 2)) + " " + ft + "\n"
+                    else:
+                        g += "G00 X" + str(round(si[0][0], 2)) + " " + ft + "\n"
                 else:
                     g += "G00" + c(si[0]) + " " + ft + "\n"
                 # write past used command and coordinates
@@ -792,38 +804,45 @@ class laser_gcode(inkex.EffectExtension):
                 # overshoot Gcode is ignored
                 # if overshoot is >0.0 G00 Y to overshoot location
             elif newcoord_different and s[1] == 'line' and strategy == "infill" and lg == 'G00':
-                # detect up direction
-                if round(si[0][1], 2) > pastY:
-                    if round(self.options.infill_overshoot, 1) > 0:
-                        g += "G00 Y" + \
-                            str(round(pastY-self.options.infill_overshoot, 2)) + " " + ft + "\n"
-                        g += "G01 Y" + str(pastY) + " " + f + "\n"
+                x, y = round(si[0][0], 2), round(si[0][1], 2)
+                overshoot = round(self.options.infill_overshoot, 1) > 0
+
+                if x == pastX:
+                    axis, begin, target = "Y", pastY, y
+                elif y == pastY:
+                    axis, begin, target = "X", pastX, x
+                else:
+                    axis = None
+
+                # a line which is neither horizontal nor vertical can not be
+                # overshot, it is burned the way it is
+                if axis is None:
                     g += tool['gcode before path'] + "\n"
-                    g += "G01 Y" + str(round(si[0][1], 2)) + " " + f + "\n"
+                    g += "G01 X" + str(x) + " Y" + str(y) + " " + f + "\n"
                     g += tool['gcode after path'] + "\n"
-                    if round(self.options.infill_overshoot, 1) > 0:
-                        g += "G01 Y" + \
-                            str(round(
-                                si[0][1]+self.options.infill_overshoot, 2)) + " " + f + "\n"
-                        # write past used command and coordinates
-                    pastX, pastY, lg = round(
-                        si[0][0], 2), round(si[0][1], 2), 'G01'
-                    # detect down direction
-                elif round(si[0][1], 2) < pastY:
-                    if round(self.options.infill_overshoot, 1) > 0:
-                        g += "G00 Y" + \
-                            str(round(pastY+self.options.infill_overshoot, 2)) + " " + ft + "\n"
-                        g += "G01 Y" + str(pastY) + " " + f + "\n"
+                    pastX, pastY, lg = x, y, 'G01'
+
+                elif target != begin:
+                    direction = 1 if target > begin else -1
+
+                    # sets the laser head to start moving before the laser
+                    # fires, fires the laser, turns it off and overshoots the
+                    # end. The overshoots give a buffer for accelerating and
+                    # decelerating the head. If overshoot is selected to be
+                    # 0.0, the overshoot Gcode is ignored
+                    if overshoot:
+                        g += "G00 " + axis + str(round(begin - direction*self.options.infill_overshoot, 2)) + " " + ft + "\n"
+                        g += "G01 " + axis + str(begin) + " " + f + "\n"
+
                     g += tool['gcode before path'] + "\n"
-                    g += "G01 Y" + str(round(si[0][1], 2)) + " " + f + "\n"
+                    g += "G01 " + axis + str(target) + " " + f + "\n"
                     g += tool['gcode after path'] + "\n"
-                    if round(self.options.infill_overshoot, 1) > 0:
-                        g += "G01 Y" + \
-                            str(round(
-                                si[0][1]-self.options.infill_overshoot, 2)) + " " + f + "\n"
-                        # write past used command and coordinates
-                    pastX, pastY, lg = round(
-                        si[0][0], 2), round(si[0][1], 2), 'G01'
+
+                    if overshoot:
+                        g += "G01 " + axis + str(round(target + direction*self.options.infill_overshoot, 2)) + " " + f + "\n"
+
+                    # write past used command and coordinates
+                    pastX, pastY, lg = x, y, 'G01'
 
                     #############################
                     # perimeter strategy
@@ -1157,7 +1176,15 @@ class laser_gcode(inkex.EffectExtension):
         global gcode
         global csp
 
-        self.options.area_fill_angle = self.options.area_fill_angle * math.pi / 180
+        # the zigzag pattern is generated vertically and rotated afterwards
+        base_angle = self.options.area_fill_angle * math.pi / 180
+
+        if self.options.infill_direction == "horizontal":
+            fill_angles = [base_angle + math.pi / 2]
+        elif self.options.infill_direction == "cross":
+            fill_angles = [base_angle, base_angle + math.pi / 2]
+        else:
+            fill_angles = [base_angle]
 
         print_("===================================================================")
         print_("Start generating infill", time.strftime("%d.%m.%Y %H:%M:%S"))
@@ -1177,8 +1204,6 @@ class laser_gcode(inkex.EffectExtension):
                 print_time("Time until path selection")
 
                 for path in self.svg.selected_paths[layer]:
-                    lines = []
-
                     print_("")
                     print_("Working on path: ")
                     style = Style.cascaded_style(path)
@@ -1199,143 +1224,158 @@ class laser_gcode(inkex.EffectExtension):
                     print_debug("csp length: ", len(csp))
                     print_time("Time for csp transformation")
 
-                    # rotate the path to get bounds in defined direction.
-                    a = - self.options.area_fill_angle
-                    rotated_path = [[[[point[0]*math.cos(a) - point[1]*math.sin(a), point[0]*math.sin(
-                        a)+point[1]*math.cos(a)] for point in sp] for sp in subpath] for subpath in csp]
-                    bounds = csp_true_bounds(rotated_path)
+                    for fill_angle in fill_angles:
+                        lines = []
 
-                    # Draw the lines
-                    # Get path's bounds
-                    b = [0.0, 0.0, 0.0, 0.0]
-                    for k in range(4):
-                        i, j, t = bounds[k][2], bounds[k][3], bounds[k][4]
-                        b[k] = csp_at_t(rotated_path[i][j-1],
-                                        rotated_path[i][j], t)[k % 2]
+                        # rotate the path to get bounds in defined direction.
+                        a = -fill_angle
+                        rotated_path = [[[[point[0]*math.cos(a) - point[1]*math.sin(a), point[0]*math.sin(
+                            a)+point[1]*math.cos(a)] for point in sp] for sp in subpath] for subpath in csp]
+                        bounds = csp_true_bounds(rotated_path)
 
-                    print_time("Time for calculating bounds")
+                        # Draw the lines
+                        # Get path's bounds
+                        b = [0.0, 0.0, 0.0, 0.0]
+                        for k in range(4):
+                            i, j, t = bounds[k][2], bounds[k][3], bounds[k][4]
+                            b[k] = csp_at_t(rotated_path[i][j-1],
+                                            rotated_path[i][j], t)[k % 2]
 
-                    # Zig-zag
-                    r = self.options.laser_beam_with / scale
-                    if r <= 0:
-                        self.error("Laser diameter must be greater than 0!", "error")
-                        return
+                        print_time("Time for calculating bounds")
 
-                    lines += [[]]
+                        # Zig-zag
+                        r = self.options.laser_beam_with / scale
+                        if r <= 0:
+                            self.error("Laser diameter must be greater than 0!", "error")
+                            return
 
-                    # i = b[0] - self.options.area_fill_shift*r
-                    i = b[0] - r + 0.001
-                    top = True
-                    last_one = True
-                    while (i < b[2] or last_one):
-                        if i >= b[2]:
-                            last_one = False
-                        if lines[-1] == []:
-                            lines[-1] += [[i, b[3]]]
-                        if top:
-                            lines[-1] += [[i, b[1]], [i+r, b[1]]]
-                        else:
-                            lines[-1] += [[i, b[3]], [i+r, b[3]]]
-                        top = not top
-                        i += r
+                        lines += [[]]
 
-                    print_time("Time for calculating zigzag pattern")
+                        # i = b[0] - self.options.area_fill_shift*r
+                        i = b[0] - r + 0.001
+                        top = True
+                        last_one = True
+                        while (i < b[2] or last_one):
+                            if i >= b[2]:
+                                last_one = False
+                            if lines[-1] == []:
+                                lines[-1] += [[i, b[3]]]
+                            if top:
+                                lines[-1] += [[i, b[1]], [i+r, b[1]]]
+                            else:
+                                lines[-1] += [[i, b[3]], [i+r, b[3]]]
+                            top = not top
+                            i += r
 
-                    # Rotate created paths back
-                    a = self.options.area_fill_angle
-                    lines = [[[point[0]*math.cos(a) - point[1]*math.sin(a), point[0]*math.sin(
-                        a)+point[1]*math.cos(a)] for point in subpath] for subpath in lines]
+                        print_time("Time for calculating zigzag pattern")
 
-                    # print_("lines: ", lines)
-                    print_time("Time for rotating")
+                        # Rotate created paths back
+                        a = fill_angle
+                        lines = [[[point[0]*math.cos(a) - point[1]*math.sin(a), point[0]*math.sin(
+                            a)+point[1]*math.cos(a)] for point in subpath] for subpath in lines]
 
-                    # get the intersection points
-                    splitted_line = [[lines[0][0]]]
+                        # print_("lines: ", lines)
+                        print_time("Time for rotating")
 
-                    for l1, l2, in zip(lines[0], lines[0][1:]):
-                        ints = []
+                        # get the intersection points
+                        splitted_line = [[lines[0][0]]]
 
-                        if l1[0] == l2[0] and l1[1] == l2[1]:
-                            continue
-                        for i in range(len(csp)):
-                            for j in range(1, len(csp[i])):
-                                sp1, sp2 = csp[i][j-1], csp[i][j]
-                                roots = csp_line_intersection(l1, l2, sp1, sp2)
-
-                                for t in roots:
-                                    p = tuple(csp_at_t(sp1, sp2, t))
-                                    if l1[0] == l2[0]:
-                                        t1 = (p[1]-l1[1])/(l2[1]-l1[1])
-                                    else:
-                                        t1 = (p[0]-l1[0])/(l2[0]-l1[0])
-                                    if 0 <= t1 <= 1:
-                                        ints += [[t1, p[0], p[1], i, j, t]]
-
-                        ints.sort()
-
-                        if len(ints) % 2 != 0:
-                            print_debug("removing intersection: ", ints)
+                        for l1, l2, in zip(lines[0], lines[0][1:]):
                             ints = []
 
-                        for i in ints:
-                            splitted_line[-1] += [[i[1], i[2]]]
-                            splitted_line += [[[i[1], i[2]]]]
-                        splitted_line[-1] += [l2]
+                            if l1[0] == l2[0] and l1[1] == l2[1]:
+                                continue
+                            for i in range(len(csp)):
+                                for j in range(1, len(csp[i])):
+                                    sp1, sp2 = csp[i][j-1], csp[i][j]
+                                    roots = csp_line_intersection(l1, l2, sp1, sp2)
+
+                                    for t in roots:
+                                        p = tuple(csp_at_t(sp1, sp2, t))
+                                        if abs(l2[0]-l1[0]) >= abs(l2[1]-l1[1]):
+                                            t1 = (p[0]-l1[0])/(l2[0]-l1[0])
+                                        else:
+                                            t1 = (p[1]-l1[1])/(l2[1]-l1[1])
+                                        if 0 <= t1 <= 1:
+                                            ints += [[t1, p[0], p[1], i, j, t]]
+
+                            ints.sort()
+
+                            if len(ints) % 2 != 0:
+                                print_debug("removing intersection: ", ints)
+                                ints = []
+
+                            for i in ints:
+                                splitted_line[-1] += [[i[1], i[2]]]
+                                splitted_line += [[[i[1], i[2]]]]
+                            splitted_line[-1] += [l2]
+                            i = 0
+
+                        print_time("Time for calculating intersections")
+                        print_debug("number of splitted lines: ", len(splitted_line))
+
+                        finalLines = []
+
+                        # TODO: fix for Windows Systems. Causes infinite loop due to lack of Fork
+                        if self.options.multi_thread and os.name != 'nt':
+                            with Pool() as pool:
+
+                                splitted_line_csp = zip(splitted_line, [csp] * len(splitted_line))
+                                finalLines = pool.map(check_if_line_inside_shape, splitted_line_csp)  # 13s; s1:57
+
+                        else:
+                            while i < len(splitted_line):
+                                finalLines += [check_if_line_inside_shape([splitted_line[i], csp])]
+                                i += 1
+
                         i = 0
 
-                    print_time("Time for calculating intersections")
-                    print_debug("number of splitted lines: ", len(splitted_line))
+                        print_time("Time for checking if line is insied of shape")
+                        print_debug("number of final lines before removing emptys: ", len(finalLines))
+                        # remove empty elements
+                        # print_("final_line: ", finalLines)
+                        np_finalLines = np.array(finalLines, dtype=np.float32)
+                        index_zeros = np.argwhere(np_finalLines == [[0, 0], [0, 0]])
+                        np_finalLines = np.delete(np_finalLines, index_zeros, axis=0)
 
-                    finalLines = []
+                        print_debug("number of final lines: ", len(np_finalLines))
 
-                    # TODO: fix for Windows Systems. Causes infinite loop due to lack of Fork
-                    if self.options.multi_thread and os.name != 'nt':
-                        with Pool() as pool:
+                        # Only the lines along the fill direction are engraved. The
+                        # steps of the zigzag pattern which connect them run
+                        # perpendicular to it and are travel moves.
+                        if len(np_finalLines) > 0:
+                            vectors = np_finalLines[:, 1] - np_finalLines[:, 0]
+                            fill_direction = np.array([-math.sin(fill_angle), math.cos(fill_angle)], dtype=np.float32)
+                            step_direction = np.array([math.cos(fill_angle), math.sin(fill_angle)], dtype=np.float32)
+                            np_finalLines = np_finalLines[np.abs(vectors @ fill_direction) >= np.abs(vectors @ step_direction)]
 
-                            splitted_line_csp = zip(splitted_line, [csp] * len(splitted_line))
-                            finalLines = pool.map(check_if_line_inside_shape, splitted_line_csp)  # 13s; s1:57
+                        if len(np_finalLines) == 0:
+                            print_("No infill lines in this direction")
+                            continue
 
-                    else:
-                        while i < len(splitted_line):
-                            finalLines += [check_if_line_inside_shape([splitted_line[i], csp])]
-                            i += 1
+                        if options.remove_tiny_infill_paths:
+                            start_coords = np.array(np_finalLines[:, 0])
+                            end_coords = np.array(np_finalLines[:, 1])
 
-                    i = 0
+                            distances = np.hypot(end_coords[:, 0]-start_coords[:, 0], end_coords[:, 1]-start_coords[:, 1])
+                            np_finalLines = (np_finalLines[distances > (TINY_INFILL_FACTOR * options.laser_beam_with)])
+                            # print_("final_line: ", np_finalLines)
 
-                    print_time("Time for checking if line is insied of shape")
-                    print_debug("number of final lines before removing emptys: ", len(finalLines))
-                    # remove empty elements
-                    # print_("final_line: ", finalLines)
-                    np_finalLines = np.array(finalLines, dtype=np.float32)
-                    index_zeros = np.argwhere(np_finalLines == [[0, 0], [0, 0]])
-                    np_finalLines = np.delete(np_finalLines, index_zeros, axis=0)
+                        print_time("Time for calculating infill paths")
 
-                    print_debug("number of final lines: ", len(np_finalLines))
+                        csp_line = csp_from_polyline(np_finalLines)
+                        csp_line = self.transform_csp(csp_line, layer, True)
 
-                    if options.remove_tiny_infill_paths:
-                        start_coords = np.array(np_finalLines[:, 0])
-                        end_coords = np.array(np_finalLines[:, 1])
+                        print_time("Time for transforming infill paths")
 
-                        distances = np.array(end_coords[:, 1]-start_coords[:, 1])
-                        distances = np.abs(distances)
-                        np_finalLines = (np_finalLines[distances > (TINY_INFILL_FACTOR * options.laser_beam_with)])
-                        # print_("final_line: ", np_finalLines)
+                        curve = self.parse_curve2d(csp_line, layer)
+                        self.draw_curve(curve, layer, area_group)
 
-                    print_time("Time for calculating infill paths")
+                        print_time("Time for drawing curve")
 
-                    csp_line = csp_from_polyline(np_finalLines)
-                    csp_line = self.transform_csp(csp_line, layer, True)
+                        gcode += self.generate_gcode(curve, layer, self.tool_infill, "infill")
 
-                    print_time("Time for transforming infill paths")
-
-                    curve = self.parse_curve2d(csp_line, layer)
-                    self.draw_curve(curve, layer, area_group)
-
-                    print_time("Time for drawing curve")
-
-                    gcode += self.generate_gcode(curve, layer, self.tool_infill, "infill")
-
-                    print_time("Time for generating Gcode")
+                        print_time("Time for generating Gcode")
 
                     if self.options.generate_bb_preview or self.options.generate_cross_preview:
                         for element in csp:

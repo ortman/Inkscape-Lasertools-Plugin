@@ -17,6 +17,11 @@
 			<param name="z-stepdown" type="float" precision="2" min="-50.00" max="0.00" _gui-text="Z-Stepdown per pass (mm):">0.00</param>			
 			<param name="add-contours" type="boolean" _gui-text="Add contours">true</param>
 			<param name="add-infill" type="boolean" _gui-text="Add infill on closed loops">true</param>					
+			<param name="infill-direction" type="optiongroup" appearance="combo" _gui-text="Infill direction:">
+				<option value="vertical">Vertical</option>
+				<option value="horizontal">Horizontal</option>
+				<option value="cross">Cross</option>
+			</param>
 			<param name="directory" type="string" _gui-text="Directory:">/insert your target directory here</param>
 			<param name="filename" type="string" _gui-text="Filename:">output.ngc</param>			
 		</page>
