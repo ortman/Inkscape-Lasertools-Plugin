@@ -205,7 +205,10 @@ def csp_line_intersection(l1, l2, sp1, sp2):
         if type(i) is complex and abs(i.imag) < 1e-7:
             i = i.real
         if type(i) is not complex and -1e-10 <= i <= 1.+1e-10:
-            retval.append(i)
+            # the solver returns the same root several times for straight
+            # segments, counting it twice would invert inside and outside
+            if not [r for r in retval if abs(r-i) < 1e-9]:
+                retval.append(i)
     return retval
 
 
@@ -291,31 +294,29 @@ def point_inside_csp(p, csp, on_the_path=True):
                         # if t == 0 we sould have considered this case previously.
 
                         if t == 1:
-                            # we have to check the next segmant if it is on the same side of the ray
+                            # The ray hits a node of the path. That is only a
+                            # crossing if the path continues to the other side
+                            # of the ray, if it turns back it just touches it.
                             st_d = csp_normalized_slope(sp1, sp2, 1)[0]
 
                             if st_d == 0:
                                 st_d = csp_normalized_slope(sp1, sp2, 0.99)[0]
 
-                            for j in range(1, len(subpath)+1):
+                            for j in range(1, len(subpath)):
+                                k = (i+j-1) % (len(subpath)-1)
+                                sp11, sp22 = subpath[k], subpath[k+1]
 
-                                if (i+j) % len(subpath) == 0:
-                                    continue  # skip the closing segment
-
-                                sp11, sp22 = subpath[(
-                                    i-1+j) % len(subpath)], subpath[(i+j) % len(subpath)]
-                                ax1, bx1, cx1, dx1 = csp_parameterize(
-                                    sp1, sp2)[::2]
-
-                                if ax1 == 0 and bx1 == 0 and cx1 == 0 and dx1 == x:
-                                    continue  # this segment parallel to the ray, so skip it
                                 en_d = csp_normalized_slope(sp11, sp22, 0)[0]
                                 if en_d == 0:
                                     en_d = csp_normalized_slope(
                                         sp11, sp22, 0.01)[0]
-                                if st_d*en_d <= 0:
+
+                                if en_d == 0:
+                                    continue  # this segment is parallel to the ray, so skip it
+
+                                if st_d*en_d > 0:
                                     ray_intersections_count += 1
-                                    break
+                                break
                     else:
                         y1 = csp_at_t(sp1, sp2, t)[1]
 
@@ -1302,8 +1303,7 @@ class laser_gcode(inkex.EffectExtension):
                             ints.sort()
 
                             if len(ints) % 2 != 0:
-                                print_debug("removing intersection: ", ints)
-                                ints = []
+                                print_debug("odd number of intersections: ", ints)
 
                             for i in ints:
                                 splitted_line[-1] += [[i[1], i[2]]]
