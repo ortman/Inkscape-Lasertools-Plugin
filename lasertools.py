@@ -24,10 +24,14 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 # standard libraries
 import cmath
 import copy
+import hashlib
 import math
 import os
 import re
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 import multiprocessing
 from multiprocessing import Pool
@@ -35,6 +39,7 @@ import datetime
 
 # 3rd party libraries
 import numpy as np
+from lxml import etree
 
 
 # local libraries
@@ -65,6 +70,11 @@ TEXT_TAGS = [inkex.addNS(tag, 'svg') for tag in ('text', 'flowRoot')]
 # silently degrade into its bounding rectangle
 UNCONVERTIBLE_TAGS = [inkex.addNS(tag, 'svg') for tag in ('image',)]
 ENGRAVING_TOLERANCE = 0.000002
+# Segments closer than this to a line are not skipped by the quick checks
+# below, the exact solver decides about them
+RAY_EPSILON = 1e-6
+# Inkscape is only called to convert text, it should never take this long
+INKSCAPE_TIMEOUT = 120
 DEFAULTS = {
     'header': """
 ;Inkscape Lasertools G-code
@@ -271,6 +281,14 @@ def point_inside_csp(p, csp, on_the_path=True):
     for subpath in csp:
         for i in range(1, len(subpath)):
             sp1, sp2 = subpath[i-1], subpath[i]
+
+            # The ray is vertical and a bezier stays within the box of its
+            # control points, so a segment which lies completely left or
+            # right of the ray can be skipped without solving anything.
+            if (sp1[1][0] < x and sp1[2][0] < x and sp2[0][0] < x and sp2[1][0] < x) or \
+               (sp1[1][0] > x and sp1[2][0] > x and sp2[0][0] > x and sp2[1][0] > x):
+                continue
+
             ax, bx, cx, dx = csp_parameterize(sp1, sp2)[::2]
             if ax == 0 and bx == 0 and cx == 0 and dx == x:
                 # we've got a special case here
@@ -408,6 +426,41 @@ def print_time(*arg):
     time = datetime.datetime.now() - timestamp
     print_(time, "   ", *arg)
     timestamp = datetime.datetime.now()
+
+def hide_windows_of(process):
+    # Inkscape opens a window even in batch mode. It ignores a hidden startup
+    # and shows the window again after every ShowWindow(SW_HIDE), so the
+    # window is moved off screen instead as soon as it shows up.
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    prototype = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+    flags = 0x0001 | 0x0004 | 0x0010
+
+    def visit(window, _):
+        owner = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        if owner.value == process.pid and user32.IsWindowVisible(window):
+            user32.SetWindowPos(window, 0, -32000, -32000, 0, 0, flags)
+        return True
+
+    callback = prototype(visit)
+
+    def watch():
+        while process.poll() is None:
+            try:
+                user32.EnumWindows(callback, None)
+            except Exception:
+                return
+            time.sleep(0.01)
+
+    thread = threading.Thread(target=watch, daemon=True)
+    thread.start()
+
 
 ################################################################################
 # Point (x,y) operations
@@ -983,6 +1036,53 @@ class laser_gcode(inkex.EffectExtension):
             sys.exit()
 
 ################################################################################
+# Run Inkscape on a copy of the document and return the result
+################################################################################
+    def run_inkscape(self, actions):
+        executable = os.environ.get("INKSCAPE_COMMAND") or inkex_command.INKSCAPE_EXECUTABLE_NAME
+
+        if not os.path.isabs(executable):
+            # inkex searches the PATH only, but the interpreter running this
+            # extension sits right next to the executable
+            candidate = os.path.join(os.path.dirname(sys.executable), executable)
+            if os.path.isfile(candidate):
+                executable = candidate
+
+        startupinfo = None
+        creationflags = 0
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        with tempfile.TemporaryDirectory(prefix="lasertools") as directory:
+            filename = os.path.join(directory, "document.svg")
+
+            with open(filename, "wb") as document:
+                document.write(self.svg.tostring())
+
+            process = subprocess.Popen(
+                [executable, filename, "--batch-process", "--export-overwrite", "--actions=" + actions],
+                # without this Inkscape hands the command line over to an
+                # already running instance instead of doing the work
+                env=dict(os.environ, SELF_CALL="true"),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                startupinfo=startupinfo, creationflags=creationflags)
+
+            hide_windows_of(process)
+
+            try:
+                process.communicate(timeout=INKSCAPE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise RuntimeError("Inkscape did not answer within {} seconds".format(INKSCAPE_TIMEOUT))
+
+            with open(filename, "rb") as document:
+                return document.read()
+
+################################################################################
 # Objects which are hidden in Inkscape are not engraved
 ################################################################################
     def is_hidden(self, node):
@@ -1000,6 +1100,15 @@ class laser_gcode(inkex.EffectExtension):
 # drawing of the user stays untouched.
 # Returns a dictionary of the outlines in root coordinates, keyed by object id
 ################################################################################
+    def text_key(self, node):
+        # A text only has to be converted again when it changed. The style is
+        # taken from specified_style() so that a font set on a parent counts
+        # as a change as well.
+        data = (etree.tostring(node)
+                + str(node.composed_transform()).encode()
+                + str(node.specified_style()).encode())
+        return hashlib.sha1(data).hexdigest()
+
     def create_text_outlines(self):
 
         def is_engraved(node):
@@ -1020,24 +1129,35 @@ class laser_gcode(inkex.EffectExtension):
             return True
 
         outlines = {}
-        ids = [i.get_id() for i in self.svg.iter() if i.tag in TEXT_TAGS and is_engraved(i)]
+        ids = []
+
+        out_transform = self.out_layer.composed_transform()
+
+        for node in self.svg.iter():
+            if node.tag not in TEXT_TAGS or not is_engraved(node):
+                continue
+
+            node_id = node.get_id()
+            key = self.text_key(node)
+            self.text_keys[node_id] = key
+
+            # the outlines of the last run are kept in the output layer, an
+            # unchanged text does not have to be converted a second time
+            if key in self.text_cache:
+                outlines[node_id] = Path(self.text_cache[key])
+            else:
+                ids.append(node_id)
 
         if len(ids) == 0:
+            if len(outlines) > 0:
+                print_("Reused the outlines of {} unchanged text objects".format(len(outlines)))
             return outlines
 
         print_("Converting {} text objects into paths".format(len(ids)))
         start_time = time.time()
 
         try:
-            if not os.environ.get("INKSCAPE_COMMAND"):
-                # inkex searches the executable in the PATH only, but the
-                # interpreter running this extension sits right next to it
-                executable = os.path.join(os.path.dirname(sys.executable), inkex_command.INKSCAPE_EXECUTABLE_NAME)
-                if os.path.isfile(executable):
-                    inkex_command.INKSCAPE_EXECUTABLE_NAME = executable
-
-            document = inkex_command.inkscape_command(
-                self.svg, actions="select-by-id:{};object-to-path".format(",".join(ids)))
+            document = self.run_inkscape("select-by-id:{};object-to-path".format(",".join(ids)))
             converted = inkex.load_svg(document).getroot()
 
         except Exception as e:
@@ -1051,13 +1171,18 @@ class laser_gcode(inkex.EffectExtension):
                 print_("Inkscape did not convert text '{}' into a path".format(node_id))
                 continue
 
-            # text using several styles is converted into a group of paths
+            # Text using several styles is converted into a group of paths.
+            # Inkscape writes them with relative commands, which would start
+            # counting from the end of the path before them once the paths
+            # are put together, so they are made absolute first.
             path = Path()
             for element in node.iter():
                 if isinstance(element, PathElement):
-                    path += element.path.transform(element.composed_transform())
+                    path += element.path.to_absolute().transform(element.composed_transform()).to_absolute()
 
             if len(path) > 0:
+                if out_transform:
+                    path = path.transform(-out_transform)
                 outlines[node_id] = path
 
         print_("Text conversion took {:.2f}s".format(time.time() - start_time))
@@ -1086,6 +1211,7 @@ class laser_gcode(inkex.EffectExtension):
                     return None
 
                 element = PathElement()
+                element.set("lasertools-text", self.text_keys[node_id])
                 path = self.text_outlines[node_id]
 
             else:
@@ -1104,9 +1230,9 @@ class laser_gcode(inkex.EffectExtension):
 
                 path = element.path.transform(transform)
 
-            out_transform = self.out_layer.composed_transform()
-            if out_transform:
-                path = path.transform(-out_transform)
+                out_transform = self.out_layer.composed_transform()
+                if out_transform:
+                    path = path.transform(-out_transform)
 
         except Exception as e:
             print_("Could not convert {} '{}' into a path: {}".format(node.TAG, node_id, e))
@@ -1305,9 +1431,20 @@ class laser_gcode(inkex.EffectExtension):
 
                             if l1[0] == l2[0] and l1[1] == l2[1]:
                                 continue
+                            dx, dy = l2[0]-l1[0], l2[1]-l1[1]
+                            epsilon = RAY_EPSILON * math.hypot(dx, dy)
+
                             for i in range(len(csp)):
                                 for j in range(1, len(csp[i])):
                                     sp1, sp2 = csp[i][j-1], csp[i][j]
+
+                                    # a segment whose control points all lie on
+                                    # the same side of the line can not cross it
+                                    sides = [(q[0]-l1[0])*dy - (q[1]-l1[1])*dx
+                                             for q in (sp1[1], sp1[2], sp2[0], sp2[1])]
+                                    if min(sides) > epsilon or max(sides) < -epsilon:
+                                        continue
+
                                     roots = csp_line_intersection(l1, l2, sp1, sp2)
 
                                     for t in roots:
@@ -1779,6 +1916,8 @@ class laser_gcode(inkex.EffectExtension):
         self.out_layer = None
         self.converted_shapes = {}
         self.text_outlines = None
+        self.text_cache = {}
+        self.text_keys = {}
         global print_
 
         for i in self.document.getroot().getchildren():
@@ -1792,6 +1931,11 @@ class laser_gcode(inkex.EffectExtension):
         MARKER_STYLE['biarc_style']['line'] = marker_style('#f88', width=self.options.laser_beam_with / scale)
 
         if self.out_layer != None:
+            for element in self.out_layer.iter():
+                key = element.get("lasertools-text")
+                if key is not None and element.get("d"):
+                    self.text_cache[key] = element.get("d")
+
             self.out_layer.clear()
         else:
             self.out_layer = self.document.getroot().add(Group())
