@@ -39,7 +39,7 @@ import numpy as np
 
 # local libraries
 import inkex
-from inkex import CubicSuperPath, Style, bezier
+from inkex import Style, bezier
 from inkex.bezier import bezierparameterize
 from inkex.transforms import Transform
 from inkex.elements import PathElement, Group, Layer, ShapeElement, Use
@@ -1005,7 +1005,9 @@ class laser_gcode(inkex.EffectExtension):
         if 'transform' in element.attrib:
             del element.attrib['transform']
 
-        style = element.style
+        # the infill decides by the fill of the path, so the style has to be
+        # taken from the original object, including the style sheets
+        style = Style.cascaded_style(node)
         style["display"] = "none"
         element.style = style
 
@@ -1051,12 +1053,6 @@ class laser_gcode(inkex.EffectExtension):
                         print_("    Found orientation points in '{}' layer: '{}'".format(layer.get(inkex.addNS('label', 'inkscape')), points))
                     else:
                         self.error("Warning! Found bad orientation points in '{}' layer. Resulting Gcode could be corrupt!".format(layer.get(inkex.addNS('label', 'inkscape'))))
-                elif i.tag == inkex.addNS('path', 'svg'):
-                    if "gcodetools" not in i.keys():
-                        self.paths[layer] = self.paths[layer] + [i] if layer in self.paths else [i]
-                        if i.get("id") in self.svg.selected:
-                            self.svg.selected_paths[layer] = self.svg.selected_paths[layer] + [
-                                i] if layer in self.svg.selected_paths else [i]
                 elif i.tag in [inkex.addNS("g", 'svg'), inkex.addNS("a", 'svg')]:
                     recursive_search(i, layer, (i.get("id") in self.svg.selected))
                 elif isinstance(i, ShapeElement) and "gcodetools" not in i.keys() and i.tag not in UNCONVERTIBLE_TAGS:
@@ -1616,87 +1612,6 @@ class laser_gcode(inkex.EffectExtension):
 
         orient_points = [[[100, doc_height], [100., 0.0, 0.0]], [[0.0, doc_height], [0.0, 0.0, 0.0]]]
 
-    ################################################################################
-    # ApplyTransform
-    ################################################################################
-    @staticmethod
-    def objectToPath(node):
-
-        if node.tag == inkex.addNS('g', 'svg'):
-            return node
-
-        if node.tag == inkex.addNS('path', 'svg') or node.tag == 'path':
-            for attName in node.attrib.keys():
-                if ("sodipodi" in attName) or ("inkscape" in attName):
-                    del node.attrib[attName]
-            return node
-
-        return node
-
-    def recursiveFuseTransform(self, node, transf=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]):
-
-        transf = Transform(transf) @ Transform(node.get("transform", None))
-
-        if 'transform' in node.attrib:
-            del node.attrib['transform']
-
-        if 'style' in node.attrib:
-            style = node.attrib.get('style')
-            style = dict(Style.parse_str(style))
-            update = False
-
-            if 'stroke-width' in style:
-                try:
-                    stroke_width = self.unittouu(style.get('stroke-width').strip())
-                    stroke_width *= math.hypot(transf[0][0], transf[1][1])
-                    style['stroke-width'] = str(stroke_width)
-                    update = True
-                except AttributeError:
-                    pass
-
-            if update:
-                node.attrib['style'] = Style(style).to_str()
-
-        node = self.objectToPath(node)
-
-        if 'd' in node.attrib:
-            d = node.get('d')
-            p = CubicSuperPath(d)
-            p = Path(p).to_absolute().transform(transf, True)
-            node.set('d', Path(CubicSuperPath(p).to_path()))
-
-        elif node.tag in [inkex.addNS('polygon', 'svg'), inkex.addNS('polyline', 'svg')]:
-            points = node.get('points')
-            points = points.strip().split(' ')
-            for k, p in enumerate(points):
-                if ',' in p:
-                    p = p.split(',')
-                    p = [float(p[0]), float(p[1])]
-                    Transform.apply_to_point(transf, p)
-                    p = [str(p[0]), str(p[1])]
-                    p = ','.join(p)
-                    points[k] = p
-            points = ' '.join(points)
-            node.set('points', points)
-
-        elif node.tag in [inkex.addNS('rect', 'svg'),
-                          inkex.addNS('text', 'svg'),
-                          inkex.addNS('image', 'svg'),
-                          inkex.addNS('use', 'svg'),
-                          inkex.addNS('circle', 'svg')]:
-            node.set('transform', str(Transform(transf)))
-
-        for child in node.getchildren():
-            self.recursiveFuseTransform(child, transf)
-
-    def applytransforms(self):
-
-        if self.svg.selected:
-            for id, shape in self.svg.selected.items():
-                self.recursiveFuseTransform(shape)
-        else:
-            self.recursiveFuseTransform(self.document.getroot())
-
     def flatten(self, tolerance=0.1):
         for layer in self.layers:
             if layer in self.svg.selected_paths:
@@ -1803,9 +1718,6 @@ class laser_gcode(inkex.EffectExtension):
         }
 
         self.get_info()
-
-        print_("Applying all transformations")
-        self.applytransforms()
 
         print_("Flattening beziers")
         self.svg.selected_paths = self.paths
