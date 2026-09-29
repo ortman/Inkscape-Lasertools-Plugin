@@ -42,7 +42,7 @@ import inkex
 from inkex import CubicSuperPath, Style, bezier
 from inkex.bezier import bezierparameterize
 from inkex.transforms import Transform
-from inkex.elements import PathElement, Group
+from inkex.elements import PathElement, Group, Layer, ShapeElement, Use
 from inkex.paths import Path
 
 if sys.version_info[0] > 2:
@@ -58,6 +58,10 @@ if "errormsg" not in dir(inkex):
 PROFILING = False   # Disable if not debugging
 DEBUG = False      # Disable if not debugging
 TINY_INFILL_FACTOR = 1  # x times the laser beam width will be removed
+# Shapes which can not be converted into a path automatically: text has no
+# outline before Path->Object to Path and an image would silently degrade
+# into its bounding rectangle
+UNCONVERTIBLE_TAGS = [inkex.addNS(tag, 'svg') for tag in ('text', 'flowRoot', 'image')]
 ENGRAVING_TOLERANCE = 0.000002
 DEFAULTS = {
     'header': """
@@ -957,6 +961,61 @@ class laser_gcode(inkex.EffectExtension):
             sys.exit()
 
 ################################################################################
+# Convert a shape which is no path (rect, ellipse, star, clone, ...) into a
+# hidden path inside the output layer, so that it can be engraved as well
+################################################################################
+    def shape_to_path(self, node):
+        node_id = node.get_id()
+
+        # get_info() is executed several times per run, only convert once
+        if node_id in self.converted_shapes:
+            return self.converted_shapes[node_id]
+
+        self.converted_shapes[node_id] = None
+
+        try:
+            element = node.to_path_element()
+
+            # to_path_element() only keeps the transformation of the node
+            # itself, but the copy is placed in the output layer, so the
+            # transformations of all original parents have to be baked into
+            # the geometry here.
+            transform = node.composed_transform()
+
+            if isinstance(node, Use):
+                # Use.get_path() ignores the x/y attributes of the clone
+                transform = transform @ Transform("translate({:f}, {:f})".format(
+                    node.to_dimensionless(node.get("x", 0)), node.to_dimensionless(node.get("y", 0))))
+
+            out_transform = self.out_layer.composed_transform()
+            if out_transform:
+                transform = -out_transform @ transform
+
+            path = element.path.transform(transform)
+
+        except Exception as e:
+            print_("Could not convert {} '{}' into a path: {}".format(node.TAG, node_id, e))
+            return None
+
+        if len(path) == 0:
+            print_("Skipped {} '{}', it has no geometry".format(node.TAG, node_id))
+            return None
+
+        element.path = path
+        if 'transform' in element.attrib:
+            del element.attrib['transform']
+
+        style = element.style
+        style["display"] = "none"
+        element.style = style
+
+        self.out_layer.add(element)
+        self.converted_shapes[node_id] = element
+        print_("Converted {} '{}' into a path".format(node.TAG, node_id))
+
+        return element
+
+################################################################################
 # Get Gcodetools info from the svg
 ################################################################################
     def get_info(self):
@@ -967,8 +1026,14 @@ class laser_gcode(inkex.EffectExtension):
         self.transform_matrix = {}
         self.transform_matrix_reverse = {}
 
-        def recursive_search(g, layer, selected=False):
-            items = g.getchildren()
+        def unsupported_object(i):
+            # Objects which can not be used are only reported when they were
+            # selected, otherwise every document would produce warnings
+            if i.get("id") in self.svg.selected:
+                self.error("Object '{}' ({}) can not be converted into a path automatically and will be ignored!\nSolution 1: press Path->Object to path or Shift+Ctrl+C.\nSolution 2: Path->Dynamic offset or Ctrl+J.\nSolution 3: export all contours to PostScript level 2 (File->Save As->.ps) and File->Import this file.".format(i.get("id"), i.tag.split("}")[-1]))
+
+        def recursive_search(g: Group, layer: Layer, selected=False):
+            items: list[ShapeElement] = g.getchildren()
             items.reverse()
             for i in items:
                 if selected:
@@ -992,10 +1057,19 @@ class laser_gcode(inkex.EffectExtension):
                         if i.get("id") in self.svg.selected:
                             self.svg.selected_paths[layer] = self.svg.selected_paths[layer] + [
                                 i] if layer in self.svg.selected_paths else [i]
-                elif i.tag == inkex.addNS("g", 'svg'):
+                elif i.tag in [inkex.addNS("g", 'svg'), inkex.addNS("a", 'svg')]:
                     recursive_search(i, layer, (i.get("id") in self.svg.selected))
-                elif i.get("id") in self.svg.selected:
-                    self.error("This extension works with Paths and Dynamic Offsets and groups of them only! All other objects will be ignored!\nSolution 1: press Path->Object to path or Shift+Ctrl+C.\nSolution 2: Path->Dynamic offset or Ctrl+J.\nSolution 3: export all contours to PostScript level 2 (File->Save As->.ps) and File->Import this file.")
+                elif isinstance(i, ShapeElement) and "gcodetools" not in i.keys() and i.tag not in UNCONVERTIBLE_TAGS:
+                    el = self.shape_to_path(i)
+                    if el is None:
+                        unsupported_object(i)
+                    else:
+                        self.paths[layer] = self.paths[layer] + [el] if layer in self.paths else [el]
+                        if i.get("id") in self.svg.selected:
+                            self.svg.selected_paths[layer] = self.svg.selected_paths[layer] + [
+                                el] if layer in self.svg.selected_paths else [el]
+                else:
+                    unsupported_object(i)
 
         recursive_search(self.document.getroot(), self.document.getroot())
 
@@ -1649,6 +1723,7 @@ class laser_gcode(inkex.EffectExtension):
         options = self.options
         options.self = self
         self.out_layer = None
+        self.converted_shapes = {}
         global print_
 
         for i in self.document.getroot().getchildren():
