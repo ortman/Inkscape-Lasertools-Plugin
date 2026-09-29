@@ -44,6 +44,7 @@ from inkex.bezier import bezierparameterize
 from inkex.transforms import Transform
 from inkex.elements import PathElement, Group, Layer, ShapeElement, Use
 from inkex.paths import Path
+from inkex import command as inkex_command
 
 if sys.version_info[0] > 2:
     xrange = range
@@ -58,10 +59,11 @@ if "errormsg" not in dir(inkex):
 PROFILING = False   # Disable if not debugging
 DEBUG = False      # Disable if not debugging
 TINY_INFILL_FACTOR = 1  # x times the laser beam width will be removed
-# Shapes which can not be converted into a path automatically: text has no
-# outline before Path->Object to Path and an image would silently degrade
-# into its bounding rectangle
-UNCONVERTIBLE_TAGS = [inkex.addNS(tag, 'svg') for tag in ('text', 'flowRoot', 'image')]
+# Text has no outline of its own, it is converted by Inkscape itself
+TEXT_TAGS = [inkex.addNS(tag, 'svg') for tag in ('text', 'flowRoot')]
+# Shapes which can not be converted into a path automatically: an image would
+# silently degrade into its bounding rectangle
+UNCONVERTIBLE_TAGS = [inkex.addNS(tag, 'svg') for tag in ('image',)]
 ENGRAVING_TOLERANCE = 0.000002
 DEFAULTS = {
     'header': """
@@ -961,7 +963,74 @@ class laser_gcode(inkex.EffectExtension):
             sys.exit()
 
 ################################################################################
-# Convert a shape which is no path (rect, ellipse, star, clone, ...) into a
+# Let Inkscape convert all text objects into paths, the same way Path->Object
+# to Path (Shift+Ctrl+C) does. This runs on a copy of the document, the
+# drawing of the user stays untouched.
+# Returns a dictionary of the outlines in root coordinates, keyed by object id
+################################################################################
+    def create_text_outlines(self):
+
+        def is_engraved(node):
+            # Empty text frames are left over in a lot of documents and would
+            # cost a call to Inkscape for nothing
+            if len("".join(node.itertext()).strip()) == 0:
+                return False
+
+            # Definitions, the output layer and the labels of the orientation
+            # points are not engraved, so they do not have to be converted
+            while node is not None:
+                if node is self.out_layer or "gcodetools" in node.keys() or node.tag == inkex.addNS('defs', 'svg'):
+                    return False
+                node = node.getparent()
+            return True
+
+        outlines = {}
+        ids = [i.get_id() for i in self.svg.iter() if i.tag in TEXT_TAGS and is_engraved(i)]
+
+        if len(ids) == 0:
+            return outlines
+
+        print_("Converting {} text objects into paths".format(len(ids)))
+        start_time = time.time()
+
+        try:
+            if not os.environ.get("INKSCAPE_COMMAND"):
+                # inkex searches the executable in the PATH only, but the
+                # interpreter running this extension sits right next to it
+                executable = os.path.join(os.path.dirname(sys.executable), inkex_command.INKSCAPE_EXECUTABLE_NAME)
+                if os.path.isfile(executable):
+                    inkex_command.INKSCAPE_EXECUTABLE_NAME = executable
+
+            document = inkex_command.inkscape_command(
+                self.svg, actions="select-by-id:{};object-to-path".format(",".join(ids)))
+            converted = inkex.load_svg(document).getroot()
+
+        except Exception as e:
+            self.error("Could not convert the text objects into paths: {}\nPlease convert them manually with Path->Object to Path or Shift+Ctrl+C.".format(e))
+            return outlines
+
+        for node_id in ids:
+            node = converted.getElementById(node_id)
+
+            if node is None or node.tag in TEXT_TAGS:
+                print_("Inkscape did not convert text '{}' into a path".format(node_id))
+                continue
+
+            # text using several styles is converted into a group of paths
+            path = Path()
+            for element in node.iter():
+                if isinstance(element, PathElement):
+                    path += element.path.transform(element.composed_transform())
+
+            if len(path) > 0:
+                outlines[node_id] = path
+
+        print_("Text conversion took {:.2f}s".format(time.time() - start_time))
+
+        return outlines
+
+################################################################################
+# Convert a shape which is no path (rect, ellipse, star, text, ...) into a
 # hidden path inside the output layer, so that it can be engraved as well
 ################################################################################
     def shape_to_path(self, node):
@@ -974,24 +1043,35 @@ class laser_gcode(inkex.EffectExtension):
         self.converted_shapes[node_id] = None
 
         try:
-            element = node.to_path_element()
+            if node.tag in TEXT_TAGS:
+                if self.text_outlines is None:
+                    self.text_outlines = self.create_text_outlines()
 
-            # to_path_element() only keeps the transformation of the node
-            # itself, but the copy is placed in the output layer, so the
-            # transformations of all original parents have to be baked into
-            # the geometry here.
-            transform = node.composed_transform()
+                if node_id not in self.text_outlines:
+                    return None
 
-            if isinstance(node, Use):
-                # Use.get_path() ignores the x/y attributes of the clone
-                transform = transform @ Transform("translate({:f}, {:f})".format(
-                    node.to_dimensionless(node.get("x", 0)), node.to_dimensionless(node.get("y", 0))))
+                element = PathElement()
+                path = self.text_outlines[node_id]
+
+            else:
+                element = node.to_path_element()
+
+                # to_path_element() only keeps the transformation of the node
+                # itself, but the copy is placed in the output layer, so the
+                # transformations of all original parents have to be baked
+                # into the geometry here.
+                transform = node.composed_transform()
+
+                if isinstance(node, Use):
+                    # Use.get_path() ignores the x/y attributes of the clone
+                    transform = transform @ Transform("translate({:f}, {:f})".format(
+                        node.to_dimensionless(node.get("x", 0)), node.to_dimensionless(node.get("y", 0))))
+
+                path = element.path.transform(transform)
 
             out_transform = self.out_layer.composed_transform()
             if out_transform:
-                transform = -out_transform @ transform
-
-            path = element.path.transform(transform)
+                path = path.transform(-out_transform)
 
         except Exception as e:
             print_("Could not convert {} '{}' into a path: {}".format(node.TAG, node_id, e))
@@ -1639,6 +1719,7 @@ class laser_gcode(inkex.EffectExtension):
         options.self = self
         self.out_layer = None
         self.converted_shapes = {}
+        self.text_outlines = None
         global print_
 
         for i in self.document.getroot().getchildren():
